@@ -1,0 +1,344 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Save boating-server.py</title>
+<style>
+  :root{--bg:#0c2531;--panel:#10303d;--line:#1f4d5e;--ink:#e9f3f5;--mute:#8fb0bd;--aqua:#37c9bd;--amber:#f2b705}
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--ink);font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;line-height:1.55;padding:26px 18px 60px}
+  .wrap{max-width:820px;margin:0 auto}
+  h1{font-size:24px;margin:0 0 6px}
+  p{color:var(--mute);margin:10px 0}
+  ol{color:var(--ink);padding-left:20px}
+  li{margin:6px 0}
+  code{background:#08202b;border:1px solid var(--line);border-radius:6px;padding:2px 7px;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:13px}
+  .btns{display:flex;flex-wrap:wrap;gap:12px;align-items:center;margin:20px 0 8px}
+  button{border:none;border-radius:11px;cursor:pointer;font-size:15px;font-weight:600;padding:14px 20px}
+  #dl{background:linear-gradient(180deg,var(--aqua),#1fa89d);color:#06222a;box-shadow:0 8px 22px -12px rgba(55,201,189,.8)}
+  #dl:hover{filter:brightness(1.06)}
+  .sec{background:var(--panel);border:1px solid var(--line)!important;color:var(--mute)}
+  .sec:hover{color:var(--ink)}
+  #msg{color:var(--amber);font-size:13.5px}
+  pre{background:#081a24;border:1px solid var(--line);border-radius:12px;padding:16px;overflow:auto;max-height:52vh;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12.5px;color:#cfe6ea;white-space:pre}
+  .note{font-size:12.5px;color:var(--mute);border-top:1px solid var(--line);margin-top:22px;padding-top:14px}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>Save boating-server.py</h1>
+  <p>Your file downloads were failing on everything except HTML, so this page rebuilds the exact server file on your own computer. Click the button and your browser saves <b>boating-server.py</b> to your Downloads folder.</p>
+  <ol>
+    <li>Click <b>Download boating-server.py</b>.</li>
+    <li>Move it into the same folder as <b>boating-dashboard.html</b>.</li>
+    <li>In that folder, run <code>python3 boating-server.py</code></li>
+  </ol>
+  <div class="btns">
+    <button id="dl">&#11015; Download boating-server.py</button>
+    <button id="cp" class="sec">Copy code instead</button>
+    <span id="msg"></span>
+  </div>
+  <pre id="view"></pre>
+  <div class="note">This page just writes the file locally in your browser. Nothing is uploaded, and there is no API key anywhere in here.</div>
+</div>
+<script id="code" type="text/plain">
+#!/usr/bin/env python3
+"""
+Passage Console - local server + data proxy
+===========================================
+
+Runs the boating dashboard on your own machine and fetches the government
+data feeds SERVER-SIDE, so your browser only ever talks to localhost. That
+sidesteps the browser CORS wall that stops the feeds loading when you open
+the .html on its own.
+
+What it proxies:
+  - DFO IWLS tide predictions (Point Atkinson)      -> /api/iwls/...
+  - NDBC buoy 46146 (Halibut Bank, ECCC-owned)      -> /api/buoy
+  - (optional) the AI "skipper's read"              -> /api/assess
+
+USAGE
+  1. Put this file in the SAME folder as boating-dashboard.html
+  2. Run:   python3 boating-server.py
+  3. It opens http://localhost:8787 in your browser.
+
+The tide + buoy panels populate automatically with no extra setup.
+
+OPTIONAL - the written AI read:
+  The hosted artifact version gets the AI for free. Run locally and it needs
+  your own Anthropic API key. Without one, everything else still works and the
+  banner verdict is still computed from the live numbers.
+    export ANTHROPIC_API_KEY="sk-ant-..."       (Windows: set ANTHROPIC_API_KEY=...)
+    export ANTHROPIC_MODEL="claude-haiku-4-5-20251001"  (optional; already the default)
+  Model list: https://docs.claude.com/en/docs/about-claude/models
+
+No third-party packages. Python 3.7+.
+"""
+
+import json
+import os
+import sys
+import webbrowser
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import urlsplit
+import urllib.request
+import urllib.error
+
+PORT = int(os.environ.get("PORT", "8787"))
+
+HTML_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "boating-dashboard.html")
+
+# --- upstream endpoints (verified live, open, no auth) ------------------------
+# DFO IWLS is mid-migration to a new Azure host; try the classic host first,
+# then fall back so the tool keeps working if the old one is retired.
+IWLS_BASES = [
+    "https://api-iwls.dfo-mpo.gc.ca/api/v1",
+    "https://api.iwls-sine.azure.cloud-nuage.dfo-mpo.gc.ca/api/v1",
+]
+BUOY_URL = "https://www.ndbc.noaa.gov/data/realtime2/46146.txt"
+ANTHROPIC_URL = "https://api.anthropic.com/v1/messages"
+
+# Default model for the OPTIONAL local AI read: Haiku 4.5, the cheapest current
+# model and plenty for this short narrative (roughly a fifth of a cent per read).
+# Override with ANTHROPIC_MODEL if your key needs a different one.
+DEFAULT_MODEL = os.environ.get("ANTHROPIC_MODEL", "claude-haiku-4-5-20251001")
+
+UA = "PassageConsole/1.0 (personal boating dashboard)"
+TIMEOUT = 20
+
+
+def _get(url, timeout=TIMEOUT):
+    req = urllib.request.Request(url, headers={"User-Agent": UA, "Accept": "*/*"})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return r.status, r.headers.get("Content-Type", ""), r.read()
+
+
+class Handler(BaseHTTPRequestHandler):
+    server_version = "PassageConsole"
+
+    # quieter, tidier logging
+    def log_message(self, fmt, *args):
+        sys.stderr.write("  %s - %s\n" % (self.address_string(), fmt % args))
+
+    # ---- small helpers -------------------------------------------------------
+    def _send(self, code, body, ctype="application/json; charset=utf-8", extra=None):
+        if isinstance(body, str):
+            body = body.encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Cache-Control", "no-store")
+        if extra:
+            for k, v in extra.items():
+                self.send_header(k, v)
+        self.end_headers()
+        if self.command != "HEAD":
+            self.wfile.write(body)
+
+    def _json(self, code, obj):
+        self._send(code, json.dumps(obj), "application/json; charset=utf-8")
+
+    # ---- CORS preflight (only matters if the page is opened cross-origin) ----
+    def do_OPTIONS(self):
+        self.send_response(204)
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        self.end_headers()
+
+    def do_HEAD(self):
+        self.do_GET()
+
+    # ---- GET: static page + read proxies ------------------------------------
+    def do_GET(self):
+        path = urlsplit(self.path).path
+
+        if path in ("/", "/index.html"):
+            return self._serve_html()
+        if path == "/favicon.ico":
+            return self._send(204, b"", "image/x-icon")
+        if path == "/api/health":
+            return self._json(200, {"ok": True})
+        if path.startswith("/api/iwls"):
+            return self._proxy_iwls()
+        if path == "/api/buoy":
+            return self._proxy_buoy()
+
+        self._json(404, {"error": "not found", "path": path})
+
+    # ---- POST: optional AI read ---------------------------------------------
+    def do_POST(self):
+        path = urlsplit(self.path).path
+        if path == "/api/assess":
+            return self._proxy_assess()
+        self._json(404, {"error": "not found", "path": path})
+
+    # ---- implementations -----------------------------------------------------
+    def _serve_html(self):
+        try:
+            with open(HTML_PATH, "rb") as f:
+                html = f.read()
+        except FileNotFoundError:
+            msg = (
+                "boating-dashboard.html was not found next to this script.\n\n"
+                "Put boating-dashboard.html in the same folder as boating-server.py, "
+                "then reload."
+            )
+            return self._send(500, msg, "text/plain; charset=utf-8")
+        self._send(200, html, "text/html; charset=utf-8")
+
+    def _proxy_iwls(self):
+        split = urlsplit(self.path)
+        rest = split.path[len("/api/iwls"):]  # e.g. /stations/<id>/data
+        if not rest.startswith("/"):
+            rest = "/" + rest
+        suffix = rest + (("?" + split.query) if split.query else "")
+
+        last_err = None
+        for base in IWLS_BASES:
+            try:
+                status, ctype, body = _get(base + suffix)
+                ct = ctype or "application/json; charset=utf-8"
+                return self._send(status, body, ct)
+            except Exception as e:  # try next host, then report
+                last_err = e
+                continue
+        self._json(
+            502,
+            {"error": "iwls_unreachable", "detail": str(last_err),
+             "hint": "Check your internet connection. If this persists, the DFO API "
+                     "host may have changed."},
+        )
+
+    def _proxy_buoy(self):
+        try:
+            status, ctype, body = _get(BUOY_URL)
+            return self._send(status, body, "text/plain; charset=utf-8")
+        except urllib.error.HTTPError as e:
+            self._json(e.code, {"error": "buoy_http_error", "code": e.code})
+        except Exception as e:
+            self._json(502, {"error": "buoy_unreachable", "detail": str(e)})
+
+    def _proxy_assess(self):
+        length = int(self.headers.get("Content-Length", "0") or "0")
+        raw = self.rfile.read(length) if length else b"{}"
+        try:
+            payload = json.loads(raw.decode("utf-8"))
+        except Exception:
+            payload = {}
+
+        key = os.environ.get("ANTHROPIC_API_KEY", "").strip()
+        if not key:
+            # No key: hand back a nicely-formatted note the dashboard can render
+            # in the assessment panel. The banner verdict still runs off the numbers.
+            note = (
+                "VERDICT: Live data on, written read off\n\n"
+                "The tide and buoy panels above are populating live from the local "
+                "proxy. The written skipper's read is the one piece that needs an "
+                "Anthropic API key when you run this locally. Set ANTHROPIC_API_KEY "
+                "and restart to switch it on. Meanwhile the banner verdict is computed "
+                "straight from the current wind, wave, and tide numbers, and the Windy "
+                "layers below are live.\n\n"
+                "BEST WINDOW: Read it off the gauges - watch for wind opposing the "
+                "tidal stream, and check the official Environment Canada forecast "
+                "before you commit."
+            )
+            return self._json(200, {"content": [{"type": "text", "text": note}]})
+
+        # Force a real model server-side (the page's default is the artifact model).
+        payload["model"] = DEFAULT_MODEL
+        payload.setdefault("max_tokens", 1000)
+
+        body = json.dumps(payload).encode("utf-8")
+        req = urllib.request.Request(
+            ANTHROPIC_URL,
+            data=body,
+            method="POST",
+            headers={
+                "Content-Type": "application/json",
+                "x-api-key": key,
+                "anthropic-version": "2023-06-01",
+                "User-Agent": UA,
+            },
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=60) as r:
+                data = r.read()
+            return self._send(200, data, "application/json; charset=utf-8")
+        except urllib.error.HTTPError as e:
+            detail = e.read().decode("utf-8", "replace")[:400]
+            return self._json(
+                e.code,
+                {"error": "anthropic_http_error", "code": e.code, "detail": detail,
+                 "hint": "If this is a model error, set ANTHROPIC_MODEL to one your "
+                         "key can access."},
+            )
+        except Exception as e:
+            return self._json(502, {"error": "anthropic_unreachable", "detail": str(e)})
+
+
+def main():
+    if not os.path.exists(HTML_PATH):
+        print("!  Heads up: boating-dashboard.html is not in this folder yet.")
+        print("   Put it next to this script, then reload the page.\n")
+
+    url = "http://localhost:%d" % PORT
+    httpd = ThreadingHTTPServer(("127.0.0.1", PORT), Handler)
+
+    print("=" * 60)
+    print("  Passage Console is running")
+    print("  Open:  %s" % url)
+    key_on = bool(os.environ.get("ANTHROPIC_API_KEY", "").strip())
+    print("  Tides + buoy: live via local proxy")
+    print("  AI skipper's read: %s"
+          % ("ON (ANTHROPIC_API_KEY found, model=%s)" % DEFAULT_MODEL
+             if key_on else "off (no ANTHROPIC_API_KEY set - optional)"))
+    print("  Stop with Ctrl+C")
+    print("=" * 60)
+
+    try:
+        webbrowser.open(url)
+    except Exception:
+        pass
+
+    try:
+        httpd.serve_forever()
+    except KeyboardInterrupt:
+        print("\n  Stopped.")
+        httpd.server_close()
+
+
+if __name__ == "__main__":
+    main()
+</script>
+<script>
+(function(){
+  var raw = document.getElementById('code').textContent.replace(/^\r?\n/, '');
+  document.getElementById('view').textContent = raw;
+  document.getElementById('dl').addEventListener('click', function(){
+    var blob = new Blob([raw], {type:'text/x-python'});
+    var url = URL.createObjectURL(blob);
+    var a = document.createElement('a');
+    a.href = url; a.download = 'boating-server.py';
+    document.body.appendChild(a); a.click(); document.body.removeChild(a);
+    setTimeout(function(){ URL.revokeObjectURL(url); }, 1500);
+    document.getElementById('msg').textContent = 'Saved to your Downloads folder.';
+  });
+  function selectView(){
+    var r = document.createRange(); r.selectNode(document.getElementById('view'));
+    var s = window.getSelection(); s.removeAllRanges(); s.addRange(r);
+    document.getElementById('msg').textContent = 'Selected. Press Ctrl or Cmd + C to copy.';
+  }
+  document.getElementById('cp').addEventListener('click', function(){
+    if(navigator.clipboard && navigator.clipboard.writeText){
+      navigator.clipboard.writeText(raw).then(function(){
+        document.getElementById('msg').textContent = 'Copied. Paste into Notepad or TextEdit (plain text) and save as boating-server.py';
+      }, selectView);
+    } else { selectView(); }
+  });
+})();
+</script>
+</body>
+</html>
